@@ -127,26 +127,32 @@ class AnnasArchiveStore(StorePlugin):
         _format = '.' + search_result.formats.lower()
 
         link_opts = self.config.get('link', {})
-        url_extension = link_opts.get('url_extension', True)
+        url_extension = link_opts.get('url_extension', False)
         content_type = link_opts.get('content_type', False)
 
         br = browser()
-        with closing(br.open(self._get_url(search_result.detail_item), timeout=timeout)) as f:
-            doc = html.fromstring(f.read())
+        doc = self._open_detail_page(br, search_result.detail_item, timeout)
+        if doc is None:
+            return
 
         for link in doc.xpath('//div[@id="md5-panel-downloads"]/ul[contains(@class, "list-inside")]/li/a[contains(@class, "js-download-link")]'):
             url = link.get('href')
             link_text = ''.join(link.itertext())
 
-            if link_text == 'Libgen.li':
-                url = self._get_libgen_link(url, br)
-            elif link_text == 'Libgen.rs Fiction' or link_text == 'Libgen.rs Non-Fiction':
-                url = self._get_libgen_nonfiction_link(url, br)
-            elif link_text.startswith('Sci-Hub'):
-                url = self._get_scihub_link(url, br)
-            elif link_text == 'Z-Library':
-                url = self._get_zlib_link(url, br)
-            else:
+            try:
+                if link_text == 'Libgen.li':
+                    url = self._get_libgen_link(url, br, timeout=timeout)
+                elif link_text == 'Libgen.rs Fiction' or link_text == 'Libgen.rs Non-Fiction':
+                    url = self._get_libgen_nonfiction_link(url, br, timeout=timeout)
+                elif link_text.startswith('Sci-Hub'):
+                    url = self._get_scihub_link(url, br, timeout=timeout)
+                elif link_text == 'Z-Library':
+                    url = self._get_zlib_link(url, br, timeout=timeout)
+                else:
+                    continue
+            except (HTTPError, URLError, TimeoutError, RemoteDisconnected, OSError):
+                # One bad mirror shouldn't kill the whole get_details. Skip it
+                # and move on so the user still sees other download options.
                 continue
 
             if not url:
@@ -158,21 +164,44 @@ class AnnasArchiveStore(StorePlugin):
                     with urlopen(Request(url, method='HEAD'), timeout=timeout) as resp:
                         if resp.info().get_content_maintype() != 'application':
                             continue
-                except (HTTPError, URLError, TimeoutError, RemoteDisconnected):
+                except (HTTPError, URLError, TimeoutError, RemoteDisconnected, OSError):
                     pass
             elif url_extension:
-                # Speeds it up by checking the extension of the url.
-                # Might miss a direct url that doesn't end with the extension
+                # Filter to URLs that look like direct file downloads (URL
+                # path ends with the requested extension). This is a fast
+                # heuristic — opt-in because most of Anna's Archive's links
+                # are session URLs that don't carry the extension.
                 params = url.find("?")
                 if params < 0:
                     params = None
-                if url.endswith(_format, 0, params):
+                if not url.endswith(_format, 0, params):
                     continue
             search_result.downloads[f"{link_text}.{search_result.formats}"] = url
 
+    def _open_detail_page(self, br, md5: str, timeout: int):
+        """Fetch the AA md5 detail page, failing over across mirrors."""
+        last_error = None
+        first_try = self.working_mirror
+        candidates = []
+        if first_try:
+            candidates.append(first_try)
+        for m in self.config.get('mirrors', DEFAULT_MIRRORS):
+            if m and m not in candidates:
+                candidates.append(m)
+        for mirror in candidates:
+            try:
+                with closing(br.open(f"{mirror}/md5/{md5}", timeout=timeout)) as resp:
+                    body = resp.read()
+            except (HTTPError, URLError, TimeoutError, RemoteDisconnected, OSError) as exc:
+                last_error = exc
+                continue
+            self.working_mirror = mirror
+            return html.fromstring(body)
+        return None
+
     @staticmethod
-    def _get_libgen_link(url: str, br) -> str:
-        with closing(br.open(url)) as resp:
+    def _get_libgen_link(url: str, br, timeout: int = 30) -> str:
+        with closing(br.open(url, timeout=timeout)) as resp:
             doc = html.fromstring(resp.read())
             base = resp.geturl()
         href = ''.join(doc.xpath('//a[h2[text()="GET"]]/@href'))
@@ -181,15 +210,15 @@ class AnnasArchiveStore(StorePlugin):
         return urljoin(base, href)
 
     @staticmethod
-    def _get_libgen_nonfiction_link(url: str, br) -> str:
-        with closing(br.open(url)) as resp:
+    def _get_libgen_nonfiction_link(url: str, br, timeout: int = 30) -> str:
+        with closing(br.open(url, timeout=timeout)) as resp:
             doc = html.fromstring(resp.read())
         url = ''.join(doc.xpath('//h2/a[text()="GET"]/@href'))
         return url
 
     @staticmethod
-    def _get_scihub_link(url, br):
-        with closing(br.open(url)) as resp:
+    def _get_scihub_link(url, br, timeout: int = 30):
+        with closing(br.open(url, timeout=timeout)) as resp:
             doc = html.fromstring(resp.read())
             base = resp.geturl()
         src = ''.join(doc.xpath('//embed[@id="pdf"]/@src'))
@@ -197,8 +226,8 @@ class AnnasArchiveStore(StorePlugin):
             return urljoin(base, src)
 
     @staticmethod
-    def _get_zlib_link(url, br):
-        with closing(br.open(url)) as resp:
+    def _get_zlib_link(url, br, timeout: int = 30):
+        with closing(br.open(url, timeout=timeout)) as resp:
             doc = html.fromstring(resp.read())
             base = resp.geturl()
         href = ''.join(doc.xpath('//a[contains(@class, "addDownloadedBook")]/@href'))

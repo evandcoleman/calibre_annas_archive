@@ -155,6 +155,158 @@ class TestHelpersAgainstLiveFixtures:
         assert "get.php" in url
         assert "md5=" in url
 
+    def test_helpers_accept_timeout(self):
+        """Inner br.open() calls in every helper must pass timeout through."""
+        body = b"<html><body></body></html>"
+        for helper, kwargs in [
+            (AnnasArchiveStore._get_libgen_link, {}),
+            (AnnasArchiveStore._get_libgen_nonfiction_link, {}),
+            (AnnasArchiveStore._get_scihub_link, {}),
+            (AnnasArchiveStore._get_zlib_link, {}),
+        ]:
+            br = MagicMock()
+            br.open.return_value = FakeResponse(body, url="https://example.com/x")
+            helper("https://example.com/x", br, timeout=7)
+            args, kw = br.open.call_args
+            assert kw.get("timeout") == 7, (
+                f"{helper.__name__} must forward timeout to br.open; got {kw}"
+            )
+
+
+@pytest.mark.unit
+class TestGetDetailsRobustness:
+    """Behaviors that protect users from cascading helper failures."""
+
+    def _setup(self, store):
+        from calibre.gui2.store.search_result import SearchResult
+        sr = SearchResult()
+        sr.detail_item = "09e074defb9d86d006bbc70e0c2f980b"
+        sr.formats = "EPUB"
+        return sr
+
+    def test_one_helper_failing_does_not_kill_others(self):
+        """A raising helper is skipped; remaining helpers still run."""
+        body = _read(DETAIL_FIXTURE)
+        store = make_store()
+        store.working_mirror = "https://annas-archive.gl"
+        sr = self._setup(store)
+
+        from urllib.error import URLError
+        detail_resp = FakeResponse(body, url="https://annas-archive.gl/md5/x")
+
+        with patch.object(aa_mod, "browser", return_value=FakeBrowser(lambda u: detail_resp)), \
+             patch.object(AnnasArchiveStore, "_get_libgen_link", side_effect=URLError("dead")), \
+             patch.object(AnnasArchiveStore, "_get_libgen_nonfiction_link", return_value="https://libgen.is/file.epub"), \
+             patch.object(AnnasArchiveStore, "_get_zlib_link", side_effect=TimeoutError("slow")):
+            store.config["link"] = {"url_extension": False, "content_type": False}
+            store.get_details(sr, timeout=5)
+
+        # Libgen.li raised, Z-Library raised — both must NOT take down the
+        # whole call, and the surviving helper's URL must still be added.
+        assert "Libgen.rs Fiction.EPUB" in sr.downloads
+
+    def test_url_extension_filter_keeps_matching_extensions(self):
+        """Regression: the filter previously dropped URLs that DID match."""
+        body = _read(DETAIL_FIXTURE)
+        store = make_store()
+        store.working_mirror = "https://annas-archive.gl"
+        sr = self._setup(store)
+
+        detail_resp = FakeResponse(body, url="https://annas-archive.gl/md5/x")
+
+        with patch.object(aa_mod, "browser", return_value=FakeBrowser(lambda u: detail_resp)), \
+             patch.object(AnnasArchiveStore, "_get_libgen_link", return_value="https://libgen.li/file.epub"), \
+             patch.object(AnnasArchiveStore, "_get_libgen_nonfiction_link", return_value="https://libgen.is/file.epub"), \
+             patch.object(AnnasArchiveStore, "_get_scihub_link", return_value=None), \
+             patch.object(AnnasArchiveStore, "_get_zlib_link", return_value=None):
+            store.config["link"] = {"url_extension": True, "content_type": False}
+            store.get_details(sr, timeout=5)
+
+        # url_extension=True: a URL ending in `.epub` must survive.
+        assert "Libgen.li.EPUB" in sr.downloads
+        assert sr.downloads["Libgen.li.EPUB"] == "https://libgen.li/file.epub"
+
+    def test_url_extension_filter_drops_non_matching_extensions(self):
+        body = _read(DETAIL_FIXTURE)
+        store = make_store()
+        store.working_mirror = "https://annas-archive.gl"
+        sr = self._setup(store)
+
+        detail_resp = FakeResponse(body, url="https://annas-archive.gl/md5/x")
+
+        with patch.object(aa_mod, "browser", return_value=FakeBrowser(lambda u: detail_resp)), \
+             patch.object(AnnasArchiveStore, "_get_libgen_link", return_value="https://libgen.li/get.php?md5=abc"), \
+             patch.object(AnnasArchiveStore, "_get_libgen_nonfiction_link", return_value=None), \
+             patch.object(AnnasArchiveStore, "_get_scihub_link", return_value=None), \
+             patch.object(AnnasArchiveStore, "_get_zlib_link", return_value=None):
+            store.config["link"] = {"url_extension": True, "content_type": False}
+            store.get_details(sr, timeout=5)
+
+        # Session URL doesn't end in `.epub` → filter drops it.
+        assert sr.downloads == {}
+
+    def test_url_extension_default_off_keeps_session_urls(self):
+        """Default behavior (no filter): session URLs are kept."""
+        body = _read(DETAIL_FIXTURE)
+        store = make_store()
+        store.working_mirror = "https://annas-archive.gl"
+        sr = self._setup(store)
+
+        detail_resp = FakeResponse(body, url="https://annas-archive.gl/md5/x")
+
+        with patch.object(aa_mod, "browser", return_value=FakeBrowser(lambda u: detail_resp)), \
+             patch.object(AnnasArchiveStore, "_get_libgen_link", return_value="https://libgen.li/get.php?md5=abc&key=K"), \
+             patch.object(AnnasArchiveStore, "_get_libgen_nonfiction_link", return_value=None), \
+             patch.object(AnnasArchiveStore, "_get_scihub_link", return_value=None), \
+             patch.object(AnnasArchiveStore, "_get_zlib_link", return_value=None):
+            # No 'link' config at all → defaults apply
+            store.config.pop("link", None)
+            store.get_details(sr, timeout=5)
+
+        assert "Libgen.li.EPUB" in sr.downloads
+
+    def test_get_details_falls_back_to_next_mirror_on_detail_page_error(self):
+        """If the working_mirror dies, get_details should try other mirrors."""
+        from urllib.error import URLError
+
+        store = make_store()
+        store.working_mirror = "https://dead.example"
+        store.config["mirrors"] = ["https://dead.example", "https://annas-archive.gl"]
+        sr = self._setup(store)
+
+        body = _read(DETAIL_FIXTURE)
+        good = FakeResponse(body, url="https://annas-archive.gl/md5/x")
+
+        def respond(url):
+            if "dead.example" in url:
+                raise URLError("nope")
+            return good
+
+        with patch.object(aa_mod, "browser", return_value=FakeBrowser(respond)), \
+             patch.object(AnnasArchiveStore, "_get_libgen_link", return_value="https://libgen.li/file.epub"), \
+             patch.object(AnnasArchiveStore, "_get_libgen_nonfiction_link", return_value=None), \
+             patch.object(AnnasArchiveStore, "_get_scihub_link", return_value=None), \
+             patch.object(AnnasArchiveStore, "_get_zlib_link", return_value=None):
+            store.config["link"] = {"url_extension": False, "content_type": False}
+            store.get_details(sr, timeout=5)
+
+        assert store.working_mirror == "https://annas-archive.gl"
+        assert "Libgen.li.EPUB" in sr.downloads
+
+    def test_get_details_silently_returns_when_all_mirrors_fail(self):
+        """If every mirror dies, return without raising — no downloads added."""
+        from urllib.error import URLError
+
+        store = make_store()
+        store.working_mirror = None
+        store.config["mirrors"] = ["https://a.example", "https://b.example"]
+        sr = self._setup(store)
+
+        with patch.object(aa_mod, "browser", return_value=FakeBrowser(lambda u: (_ for _ in ()).throw(URLError("dead")))):
+            store.get_details(sr, timeout=5)
+
+        assert sr.downloads == {}
+
     def test_zlib_helper_returns_none_against_js_challenge(self):
         """Document the breakage: z-lib.gd now serves a JS challenge."""
         body = _read(ZLIB_FIXTURE)

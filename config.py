@@ -174,7 +174,7 @@ class ConfigWidget(QWidget):
             configuration.load(search_opts.get(configuration.config_option, configuration.default))
 
         link_opts = config.get('link', {})
-        self.url_extension.setChecked(link_opts.get('url_extension', True))
+        self.url_extension.setChecked(link_opts.get('url_extension', False))
         self.content_type.setChecked(link_opts.get('content_type', False))
 
     def save_settings(self):
