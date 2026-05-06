@@ -1,0 +1,83 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+      - run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+      - run: pytest -v
+
+  release:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # full history for changelog generation
+
+      - name: Verify tag matches plugin version
+        id: version
+        run: |
+          tag="${GITHUB_REF#refs/tags/v}"
+          plugin_version=$(python3 -c "import re; m=re.search(r'version\s*=\s*\((\d+),\s*(\d+),\s*(\d+)\)', open('__init__.py').read()); print('.'.join(m.groups()))")
+          if [ "$tag" != "$plugin_version" ]; then
+            echo "::error::Tag v$tag does not match plugin version ($plugin_version) in __init__.py"
+            exit 1
+          fi
+          echo "version=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Build plugin zip
+        run: |
+          chmod +x zip_release.sh
+          ./zip_release.sh
+          ls -la calibre_annas_archive-v*.zip
+
+      - name: Generate changelog
+        id: changelog
+        run: |
+          version="${{ steps.version.outputs.version }}"
+          # Find the previous release tag (excluding the one we're building).
+          prev=$(git describe --tags --abbrev=0 --match "v*.*.*" "v${version}^" 2>/dev/null || echo "")
+          {
+            echo "## Changes"
+            echo
+            if [ -n "$prev" ]; then
+              echo "### Since [$prev](../../releases/tag/$prev)"
+              echo
+              git log --pretty=format:'- %s (%h)' "${prev}..v${version}" -- ':!tests/fixtures'
+            else
+              git log --pretty=format:'- %s (%h)' "v${version}" -- ':!tests/fixtures'
+            fi
+            echo
+            echo
+            echo "## Installation"
+            echo
+            echo 'Download `calibre_annas_archive-v'"${version}"'.zip` below, then in Calibre go to `Preferences > Plugins > Load plugin from file` and select the downloaded zip.'
+          } > CHANGELOG_RELEASE.md
+          cat CHANGELOG_RELEASE.md
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          version="${{ steps.version.outputs.version }}"
+          gh release create "v${version}" \
+            --title "v${version}" \
+            --notes-file CHANGELOG_RELEASE.md \
+            "calibre_annas_archive-v${version}.zip"
