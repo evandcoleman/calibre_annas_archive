@@ -169,7 +169,8 @@ class TestGetUrl:
 class TestSearchMirrorFailover:
     def _patched_search(self, store, *, browser_responses, html_body=b"<html></html>"):
         fake_br = FakeBrowser(browser_responses)
-        with patch.object(aa_mod, "browser", return_value=fake_br):
+        with patch.object(aa_mod, "browser", return_value=fake_br), \
+             patch.object(aa_mod.time, "sleep"):
             return list(store._search(
                 "{base}/search?page={page}&q=x&display=table",
                 max_results=1,
@@ -202,9 +203,31 @@ class TestSearchMirrorFailover:
 
         results, br = self._patched_search(store, browser_responses=respond)
         assert results == []
-        # Should have tried the first mirror, failed, then succeeded on the second.
-        assert len(br.calls) == 2
+        # Tries mirror 0 twice (retry), then succeeds on mirror 1.
+        assert len(br.calls) == 3
+        assert all(DEFAULT_MIRRORS[0] in c[0] for c in br.calls[:2])
+        assert DEFAULT_MIRRORS[1] in br.calls[2][0]
         assert store.working_mirror == DEFAULT_MIRRORS[1]
+
+    def test_retries_same_mirror_on_transient_error(self):
+        """A single 502 should not give up on the mirror — retry once."""
+        from urllib.error import HTTPError
+        import io
+        store = make_store()
+        ok = FakeResponse(b"<html><body><table></table></body></html>", code=200)
+        calls = {"n": 0}
+
+        def respond(url):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise HTTPError(url, 502, "Bad Gateway", {}, io.BytesIO(b""))
+            return ok
+
+        results, br = self._patched_search(store, browser_responses=respond)
+        assert results == []
+        # First call 502'd, retry succeeded — 2 calls total, all to mirror 0.
+        assert len(br.calls) == 2
+        assert store.working_mirror == DEFAULT_MIRRORS[0]
 
     def test_raises_when_all_mirrors_fail(self):
         from urllib.error import URLError

@@ -91,7 +91,8 @@ class TestDetailPagePanelXpath:
 
         detail_resp = FakeResponse(body, url="https://annas-archive.gl/md5/x")
 
-        with patch.object(aa_mod, "browser", return_value=FakeBrowser(lambda u: detail_resp)), \
+        with patch.object(aa_mod.time, "sleep"), \
+             patch.object(aa_mod, "browser", return_value=FakeBrowser(lambda u: detail_resp)), \
              patch.object(AnnasArchiveStore, "_get_libgen_link", return_value=None), \
              patch.object(AnnasArchiveStore, "_get_libgen_nonfiction_link", return_value=None), \
              patch.object(AnnasArchiveStore, "_get_scihub_link", return_value=None), \
@@ -122,7 +123,8 @@ class TestDetailPagePanelXpath:
         # `browser()` returns the stub used to fetch the detail page.
         detail_resp = FakeResponse(body, url="https://annas-archive.gl/md5/09e074defb9d86d006bbc70e0c2f980b")
 
-        with patch.object(aa_mod, "browser", return_value=FakeBrowser(lambda u: detail_resp)), \
+        with patch.object(aa_mod.time, "sleep"), \
+             patch.object(aa_mod, "browser", return_value=FakeBrowser(lambda u: detail_resp)), \
              patch.object(AnnasArchiveStore, "_get_libgen_link", return_value="https://libgen.li/file.epub") as m_lg, \
              patch.object(AnnasArchiveStore, "_get_libgen_nonfiction_link", return_value="https://libgen.is/file.epub") as m_lgnf, \
              patch.object(AnnasArchiveStore, "_get_scihub_link", return_value=None) as m_sh, \
@@ -211,7 +213,8 @@ class TestGetDetailsRobustness:
         from urllib.error import URLError
         detail_resp = FakeResponse(body, url="https://annas-archive.gl/md5/x")
 
-        with patch.object(aa_mod, "browser", return_value=FakeBrowser(lambda u: detail_resp)), \
+        with patch.object(aa_mod.time, "sleep"), \
+             patch.object(aa_mod, "browser", return_value=FakeBrowser(lambda u: detail_resp)), \
              patch.object(AnnasArchiveStore, "_get_libgen_link", side_effect=URLError("dead")), \
              patch.object(AnnasArchiveStore, "_get_libgen_nonfiction_link", return_value="https://libgen.is/file.epub"), \
              patch.object(AnnasArchiveStore, "_get_zlib_link", side_effect=TimeoutError("slow")):
@@ -231,7 +234,8 @@ class TestGetDetailsRobustness:
 
         detail_resp = FakeResponse(body, url="https://annas-archive.gl/md5/x")
 
-        with patch.object(aa_mod, "browser", return_value=FakeBrowser(lambda u: detail_resp)), \
+        with patch.object(aa_mod.time, "sleep"), \
+             patch.object(aa_mod, "browser", return_value=FakeBrowser(lambda u: detail_resp)), \
              patch.object(AnnasArchiveStore, "_get_libgen_link", return_value="https://libgen.li/file.epub"), \
              patch.object(AnnasArchiveStore, "_get_libgen_nonfiction_link", return_value="https://libgen.is/file.epub"), \
              patch.object(AnnasArchiveStore, "_get_scihub_link", return_value=None), \
@@ -251,7 +255,8 @@ class TestGetDetailsRobustness:
 
         detail_resp = FakeResponse(body, url="https://annas-archive.gl/md5/x")
 
-        with patch.object(aa_mod, "browser", return_value=FakeBrowser(lambda u: detail_resp)), \
+        with patch.object(aa_mod.time, "sleep"), \
+             patch.object(aa_mod, "browser", return_value=FakeBrowser(lambda u: detail_resp)), \
              patch.object(AnnasArchiveStore, "_get_libgen_link", return_value="https://libgen.li/get.php?md5=abc"), \
              patch.object(AnnasArchiveStore, "_get_libgen_nonfiction_link", return_value=None), \
              patch.object(AnnasArchiveStore, "_get_scihub_link", return_value=None), \
@@ -271,7 +276,8 @@ class TestGetDetailsRobustness:
 
         detail_resp = FakeResponse(body, url="https://annas-archive.gl/md5/x")
 
-        with patch.object(aa_mod, "browser", return_value=FakeBrowser(lambda u: detail_resp)), \
+        with patch.object(aa_mod.time, "sleep"), \
+             patch.object(aa_mod, "browser", return_value=FakeBrowser(lambda u: detail_resp)), \
              patch.object(AnnasArchiveStore, "_get_libgen_link", return_value="https://libgen.li/get.php?md5=abc&key=K"), \
              patch.object(AnnasArchiveStore, "_get_libgen_nonfiction_link", return_value=None), \
              patch.object(AnnasArchiveStore, "_get_scihub_link", return_value=None), \
@@ -310,6 +316,66 @@ class TestGetDetailsRobustness:
         assert store.working_mirror == "https://annas-archive.gl"
         assert "Libgen.li.EPUB" in sr.downloads
 
+    def test_get_details_retries_same_mirror_on_transient_502(self):
+        """Single 502 from the working mirror should not produce empty downloads."""
+        from urllib.error import HTTPError
+        import io
+
+        body = _read(DETAIL_FIXTURE)
+        store = make_store()
+        store.working_mirror = "https://annas-archive.gl"
+        store.config["mirrors"] = ["https://annas-archive.gl"]  # only one mirror — common user setup
+        sr = self._setup(store)
+
+        ok = FakeResponse(body, url="https://annas-archive.gl/md5/x")
+        calls = {"n": 0}
+
+        def respond(url):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise HTTPError(url, 502, "Bad Gateway", {}, io.BytesIO(b""))
+            return ok
+
+        with patch.object(aa_mod.time, "sleep"), \
+             patch.object(aa_mod, "browser", return_value=FakeBrowser(respond)), \
+             patch.object(AnnasArchiveStore, "_get_libgen_link", return_value=None), \
+             patch.object(AnnasArchiveStore, "_get_libgen_nonfiction_link", return_value=None), \
+             patch.object(AnnasArchiveStore, "_get_scihub_link", return_value=None), \
+             patch.object(AnnasArchiveStore, "_get_zlib_link", return_value=None):
+            store.config["link"] = {"url_extension": False, "content_type": False}
+            store.get_details(sr, timeout=5)
+
+        # Despite the 502, retry succeeded and Partner Server links populate.
+        assert any("Partner Server" in k for k in sr.downloads), sr.downloads
+
+    def test_get_details_rejects_response_missing_panel(self):
+        """A 200 with junk HTML (e.g. error page rendered as 200) shouldn't fool us."""
+        store = make_store()
+        store.working_mirror = "https://annas-archive.gl"
+        store.config["mirrors"] = ["https://annas-archive.gl", "https://annas-archive.org"]
+        sr = self._setup(store)
+
+        good = FakeResponse(_read(DETAIL_FIXTURE), url="https://annas-archive.org/md5/x")
+        junk = FakeResponse(b"<html><body><h1>maintenance</h1></body></html>", url="https://annas-archive.gl/md5/x")
+
+        def respond(url):
+            if "annas-archive.gl" in url:
+                return junk
+            return good
+
+        with patch.object(aa_mod.time, "sleep"), \
+             patch.object(aa_mod, "browser", return_value=FakeBrowser(respond)), \
+             patch.object(AnnasArchiveStore, "_get_libgen_link", return_value=None), \
+             patch.object(AnnasArchiveStore, "_get_libgen_nonfiction_link", return_value=None), \
+             patch.object(AnnasArchiveStore, "_get_scihub_link", return_value=None), \
+             patch.object(AnnasArchiveStore, "_get_zlib_link", return_value=None):
+            store.config["link"] = {"url_extension": False, "content_type": False}
+            store.get_details(sr, timeout=5)
+
+        # gl returned 200 with junk HTML; plugin must reject it and fall back to .org
+        assert store.working_mirror == "https://annas-archive.org"
+        assert any("Partner Server" in k for k in sr.downloads)
+
     def test_get_details_silently_returns_when_all_mirrors_fail(self):
         """If every mirror dies, return without raising — no downloads added."""
         from urllib.error import URLError
@@ -319,7 +385,8 @@ class TestGetDetailsRobustness:
         store.config["mirrors"] = ["https://a.example", "https://b.example"]
         sr = self._setup(store)
 
-        with patch.object(aa_mod, "browser", return_value=FakeBrowser(lambda u: (_ for _ in ()).throw(URLError("dead")))):
+        with patch.object(aa_mod.time, "sleep"), \
+             patch.object(aa_mod, "browser", return_value=FakeBrowser(lambda u: (_ for _ in ()).throw(URLError("dead")))):
             store.get_details(sr, timeout=5)
 
         assert sr.downloads == {}

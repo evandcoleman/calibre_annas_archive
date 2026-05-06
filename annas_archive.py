@@ -1,3 +1,4 @@
+import time
 from contextlib import closing
 from http.client import RemoteDisconnected
 from math import ceil
@@ -5,6 +6,11 @@ from typing import Generator
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote_plus, urljoin
 from urllib.request import urlopen, Request
+
+# Errors that warrant a retry on the same mirror — usually transient (502s
+# from AA's nginx, brief connection resets, slow responses).
+_TRANSIENT_ERRORS = (HTTPError, URLError, TimeoutError, RemoteDisconnected, OSError)
+_MIRROR_RETRIES = 2  # total attempts per mirror
 
 from calibre import browser
 from calibre.gui2 import open_url
@@ -49,15 +55,20 @@ class AnnasArchiveStore(StorePlugin):
             doc = None
             last_error = None
             for mirror in mirrors:
-                try:
-                    with closing(br.open(url.format(base=mirror, page=page), timeout=timeout)) as resp:
-                        body = resp.read()
-                except (HTTPError, URLError, TimeoutError, RemoteDisconnected, OSError) as exc:
-                    last_error = exc
-                    continue
-                self.working_mirror = mirror
-                doc = html.fromstring(body)
-                break
+                for attempt in range(_MIRROR_RETRIES):
+                    try:
+                        with closing(br.open(url.format(base=mirror, page=page), timeout=timeout)) as resp:
+                            body = resp.read()
+                    except _TRANSIENT_ERRORS as exc:
+                        last_error = exc
+                        if attempt + 1 < _MIRROR_RETRIES:
+                            time.sleep(0.5 * (attempt + 1))
+                        continue
+                    self.working_mirror = mirror
+                    doc = html.fromstring(body)
+                    break
+                if doc is not None:
+                    break
             if doc is None:
                 self.working_mirror = None
                 raise Exception(
@@ -188,8 +199,11 @@ class AnnasArchiveStore(StorePlugin):
             search_result.downloads[f"{link_text}.{search_result.formats}"] = url
 
     def _open_detail_page(self, br, md5: str, timeout: int):
-        """Fetch the AA md5 detail page, failing over across mirrors."""
-        last_error = None
+        """Fetch the AA md5 detail page, retrying on transient errors and
+        failing over across mirrors. Verifies the parsed page contains the
+        expected `md5-panel-downloads` element so a 502 body slipping
+        through as a 200 doesn't masquerade as a real result.
+        """
         first_try = self.working_mirror
         candidates = []
         if first_try:
@@ -198,14 +212,22 @@ class AnnasArchiveStore(StorePlugin):
             if m and m not in candidates:
                 candidates.append(m)
         for mirror in candidates:
-            try:
-                with closing(br.open(f"{mirror}/md5/{md5}", timeout=timeout)) as resp:
-                    body = resp.read()
-            except (HTTPError, URLError, TimeoutError, RemoteDisconnected, OSError) as exc:
-                last_error = exc
-                continue
-            self.working_mirror = mirror
-            return html.fromstring(body)
+            for attempt in range(_MIRROR_RETRIES):
+                try:
+                    with closing(br.open(f"{mirror}/md5/{md5}", timeout=timeout)) as resp:
+                        body = resp.read()
+                except _TRANSIENT_ERRORS:
+                    if attempt + 1 < _MIRROR_RETRIES:
+                        time.sleep(0.5 * (attempt + 1))
+                    continue
+                doc = html.fromstring(body)
+                if doc.xpath('boolean(//div[@id="md5-panel-downloads"])'):
+                    self.working_mirror = mirror
+                    return doc
+                # 200 OK but the page doesn't look like a real md5 page —
+                # treat as a soft failure and retry / try next mirror.
+                if attempt + 1 < _MIRROR_RETRIES:
+                    time.sleep(0.5 * (attempt + 1))
         return None
 
     @staticmethod
