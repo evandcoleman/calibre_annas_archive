@@ -3,7 +3,7 @@ from http.client import RemoteDisconnected
 from math import ceil
 from typing import Generator
 from urllib.error import HTTPError, URLError
-from urllib.parse import quote_plus
+from urllib.parse import quote_plus, urljoin
 from urllib.request import urlopen, Request
 
 from calibre import browser
@@ -28,25 +28,42 @@ class AnnasArchiveStore(StorePlugin):
         super().__init__(gui, name, config, base_plugin)
         self.working_mirror = None
 
+    def _ordered_mirrors(self):
+        """Return a fresh list of mirrors, last working one first.
+
+        Always returns a new list so callers can reorder without mutating the
+        configured list or the module-level DEFAULT_MIRRORS.
+        """
+        mirrors = list(self.config.get('mirrors', DEFAULT_MIRRORS))
+        if self.working_mirror and self.working_mirror in mirrors:
+            mirrors.remove(self.working_mirror)
+            mirrors.insert(0, self.working_mirror)
+        return mirrors
+
     def _search(self, url: str, max_results: int, timeout: int) -> SearchResults:
         br = browser()
-        doc = None
         counter = max_results
 
         for page in range(1, ceil(max_results / RESULTS_PER_PAGE) + 1):
-            mirrors = self.config.get('mirrors', DEFAULT_MIRRORS)
-            if self.working_mirror is not None:
-                mirrors.remove(self.working_mirror)
-                mirrors.insert(0, self.working_mirror)
+            mirrors = self._ordered_mirrors()
+            doc = None
+            last_error = None
             for mirror in mirrors:
-                with closing(br.open(url.format(base=mirror, page=page), timeout=timeout)) as resp:
-                    if resp.code < 500 or resp.code > 599:
-                        self.working_mirror = mirror
-                        doc = html.fromstring(resp.read())
-                        break
+                try:
+                    with closing(br.open(url.format(base=mirror, page=page), timeout=timeout)) as resp:
+                        body = resp.read()
+                except (HTTPError, URLError, TimeoutError, RemoteDisconnected, OSError) as exc:
+                    last_error = exc
+                    continue
+                self.working_mirror = mirror
+                doc = html.fromstring(body)
+                break
             if doc is None:
                 self.working_mirror = None
-                raise Exception('No working mirrors of Anna\'s Archive found.')
+                raise Exception(
+                    "No working mirrors of Anna's Archive found"
+                    + (f" (last error: {last_error})" if last_error else '')
+                )
 
             books = doc.xpath('//table/tr')
             for book in books:
@@ -157,9 +174,11 @@ class AnnasArchiveStore(StorePlugin):
     def _get_libgen_link(url: str, br) -> str:
         with closing(br.open(url)) as resp:
             doc = html.fromstring(resp.read())
-            scheme, _, host, _ = resp.geturl().split('/', 3)
-        url = ''.join(doc.xpath('//a[h2[text()="GET"]]/@href'))
-        return f"{scheme}//{host}/{url}"
+            base = resp.geturl()
+        href = ''.join(doc.xpath('//a[h2[text()="GET"]]/@href'))
+        if not href:
+            return ''
+        return urljoin(base, href)
 
     @staticmethod
     def _get_libgen_nonfiction_link(url: str, br) -> str:
@@ -172,19 +191,19 @@ class AnnasArchiveStore(StorePlugin):
     def _get_scihub_link(url, br):
         with closing(br.open(url)) as resp:
             doc = html.fromstring(resp.read())
-            scheme, _ = resp.geturl().split('/', 1)
-        url = ''.join(doc.xpath('//embed[@id="pdf"]/@src'))
-        if url:
-            return scheme + url
+            base = resp.geturl()
+        src = ''.join(doc.xpath('//embed[@id="pdf"]/@src'))
+        if src:
+            return urljoin(base, src)
 
     @staticmethod
     def _get_zlib_link(url, br):
         with closing(br.open(url)) as resp:
             doc = html.fromstring(resp.read())
-            scheme, _, host, _ = resp.geturl().split('/', 3)
-        url = ''.join(doc.xpath('//a[contains(@class, "addDownloadedBook")]/@href'))
-        if url:
-            return f"{scheme}//{host}/{url}"
+            base = resp.geturl()
+        href = ''.join(doc.xpath('//a[contains(@class, "addDownloadedBook")]/@href'))
+        if href:
+            return urljoin(base, href)
 
     def _get_url(self, md5):
         return f"{self.working_mirror}/md5/{md5}"
