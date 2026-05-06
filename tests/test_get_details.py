@@ -64,32 +64,49 @@ class TestDetailPagePanelXpath:
         assert any("Libgen.li" in t for t in texts), texts
         assert any("Z-Library" in t for t in texts), texts
 
-    def test_partner_server_links_are_invisible_to_current_xpath(self):
-        """Document a known gap: Partner Server links live in a wrapped <ul>.
-
-        The current xpath uses `/ul` (direct child). Partner Server links sit
-        inside `div.mb-4 > ul.list-inside`, so they're missed. They're also
-        DDoS-Guard gated and not auto-followable today, so this is a known
-        limitation rather than something to fix without a working follow-
-        through.
-        """
+    def test_partner_server_links_are_now_visible(self):
+        """Regression: previously /ul (direct child) missed Partner Server links."""
         from lxml import html
 
         body = _read(DETAIL_FIXTURE)
         doc = html.fromstring(body)
-        plugin_xpath = (
-            '//div[@id="md5-panel-downloads"]/ul[contains(@class, "list-inside")]'
+        # The plugin's xpath should match Partner Server links on this fixture.
+        new_xpath = (
+            '//div[@id="md5-panel-downloads"]//ul[contains(@class, "list-inside")]'
             '/li/a[contains(@class, "js-download-link")]'
         )
-        broad_xpath = (
-            '//div[@id="md5-panel-downloads"]'
-            '//a[contains(@class, "js-download-link")]'
-        )
-        plugin_count = len(doc.xpath(plugin_xpath))
-        broad_count = len(doc.xpath(broad_xpath))
-        assert broad_count > plugin_count, (
-            "fixture should contain Partner Server links the broad xpath catches"
-        )
+        texts = [' '.join(a.itertext()).strip() for a in doc.xpath(new_xpath)]
+        assert any(t.startswith("Fast Partner Server") for t in texts), texts
+        assert any(t.startswith("Slow Partner Server") for t in texts), texts
+
+    def test_partner_server_urls_are_emitted_as_absolute(self):
+        body = _read(DETAIL_FIXTURE)
+        store = make_store()
+        store.working_mirror = "https://annas-archive.gl"
+
+        from calibre.gui2.store.search_result import SearchResult
+        sr = SearchResult()
+        sr.detail_item = "09e074defb9d86d006bbc70e0c2f980b"
+        sr.formats = "EPUB"
+
+        detail_resp = FakeResponse(body, url="https://annas-archive.gl/md5/x")
+
+        with patch.object(aa_mod, "browser", return_value=FakeBrowser(lambda u: detail_resp)), \
+             patch.object(AnnasArchiveStore, "_get_libgen_link", return_value=None), \
+             patch.object(AnnasArchiveStore, "_get_libgen_nonfiction_link", return_value=None), \
+             patch.object(AnnasArchiveStore, "_get_scihub_link", return_value=None), \
+             patch.object(AnnasArchiveStore, "_get_zlib_link", return_value=None):
+            store.config["link"] = {"url_extension": False, "content_type": False}
+            store.get_details(sr, timeout=5)
+
+        # Every Partner Server label should be an entry, mapped to an
+        # absolute AA URL on the working mirror.
+        partner_keys = [k for k in sr.downloads if "Partner Server" in k]
+        assert partner_keys, sr.downloads
+        for key in partner_keys:
+            url = sr.downloads[key]
+            assert url.startswith("https://annas-archive.gl/"), url
+            assert "/fast_download/" in url or "/slow_download/" in url, url
 
     def test_get_details_routes_known_link_types(self):
         """Run get_details with mocked helpers; assert which routes fire."""

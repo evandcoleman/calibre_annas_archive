@@ -135,12 +135,21 @@ class AnnasArchiveStore(StorePlugin):
         if doc is None:
             return
 
-        for link in doc.xpath('//div[@id="md5-panel-downloads"]/ul[contains(@class, "list-inside")]/li/a[contains(@class, "js-download-link")]'):
+        # `//ul` (descendant) instead of `/ul` (direct child) — AA's Partner
+        # Server links live in a wrapped <ul> one level deeper than the
+        # external-mirror list, and the original xpath missed them entirely.
+        for link in doc.xpath('//div[@id="md5-panel-downloads"]//ul[contains(@class, "list-inside")]/li/a[contains(@class, "js-download-link")]'):
             url = link.get('href')
             link_text = ''.join(link.itertext())
 
             try:
-                if link_text == 'Libgen.li':
+                if link_text.startswith('Fast Partner Server') or link_text.startswith('Slow Partner Server'):
+                    # First-party AA download. /fast_download/ requires a
+                    # membership cookie; /slow_download/ serves a wait page.
+                    # Pass the absolute URL through as-is — Calibre's browser
+                    # already carries any cookies set during the search flow.
+                    url = urljoin(self.working_mirror or '', url)
+                elif link_text == 'Libgen.li':
                     url = self._get_libgen_link(url, br, timeout=timeout)
                 elif link_text == 'Libgen.rs Fiction' or link_text == 'Libgen.rs Non-Fiction':
                     url = self._get_libgen_nonfiction_link(url, br, timeout=timeout)
